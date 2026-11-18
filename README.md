@@ -1,4 +1,24 @@
-# Forge — a GitHub-compatible git forge in one process
+# github-core-forge
+
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/arnesasarizky/github-core-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/arnesasarizky/github-core-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A GitHub-compatible git forge in one Node process: git smart HTTP,
+REST v3, GraphQL v4 and MCP over one in-memory store, standard
+library only.
+
+## Run it
+
+```sh
+node main.ts
+```
+
+(The harness sets `MAKEFUN_ENV_URL` and `MAKEFUN_SHOP_TOKEN`; the
+forge registers its ephemeral port there and serves until the suite
+says it is done.)
+
+---
 
 A standalone forge that serves, from one Node process and its own
 in-memory store:
@@ -37,3 +57,6 @@ produces byte-identical exports.
 Layout: `git.ts` (objects, packs, pkt-lines), `store.ts` (state),
 `githttp.ts` (smart HTTP), `rest.ts` (REST v3 + merges),
 `graphql.ts` (GraphQL), `mcp.ts` (MCP), `app.ts` (the HTTP server).
+
+---
+<sub>Entered on [make.fun](https://make.fun/?ref=1c1337d4&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
