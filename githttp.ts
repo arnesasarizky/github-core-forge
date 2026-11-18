@@ -5,12 +5,12 @@
 
 import {
   ZERO_OID,
-  parseCommit,
+  commitInfoOf,
   parsePktLines,
-  parseTree,
   pktLine,
   pktText,
   readPack,
+  treeEntriesOf,
   writePack,
   type GitObject,
 } from './git.ts';
@@ -31,11 +31,11 @@ export function closureOf(repo: RepoState, roots: readonly string[], boundary?: 
     if (!obj) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
+      const commit = commitInfoOf(oid, obj.data);
       stack.push(commit.tree);
       if (!boundary || !boundary.has(oid)) stack.push(...commit.parents);
     } else if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+      for (const entry of treeEntriesOf(oid, obj.data)) stack.push(entry.oid);
     } else if (obj.type === 'tag') {
       const target = /object ([0-9a-f]{40})/.exec(obj.data.toString('utf8'));
       if (target) stack.push(target[1]);
@@ -55,14 +55,36 @@ function commitAncestors(repo: RepoState, from: string, boundary?: ReadonlySet<s
     if (!obj || obj.type !== 'commit') continue;
     seen.add(oid);
     if (boundary && boundary.has(oid)) continue;
-    stack.push(...parseCommit(obj.data).parents);
+    stack.push(...commitInfoOf(oid, obj.data).parents);
   }
   return seen;
 }
 
+/**
+ * Full ancestor sets, memoized by commit id (content hashes: a
+ * commit's ancestors never change). A fast-forward check on a long
+ * chain would otherwise re-walk the whole history on every push.
+ */
+const ancestorsCache = new Map<string, Set<string>>();
+
+function ancestorsOf(repo: RepoState, oid: string): Set<string> {
+  let cached = ancestorsCache.get(oid);
+  if (cached) return cached;
+  if (ancestorsCache.size > 100000) ancestorsCache.clear();
+  cached = new Set<string>([oid]);
+  ancestorsCache.set(oid, cached);
+  const obj = repo.store.get(oid);
+  if (obj?.type === 'commit') {
+    for (const parent of commitInfoOf(oid, obj.data).parents) {
+      for (const ancestor of ancestorsOf(repo, parent)) cached.add(ancestor);
+    }
+  }
+  return cached;
+}
+
 export function isAncestor(repo: RepoState, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return commitAncestors(repo, descendant).has(ancestor);
+  return ancestorsOf(repo, descendant).has(ancestor);
 }
 
 /** Peel a tag (or return the commit itself) to the commit it names. */
@@ -203,7 +225,7 @@ function planFetch(
       // floor is sent.
       if (shallowBoundary.has(oid) && !isWant && deepen === null) continue;
       includeCommits.add(oid);
-      const parents = parseCommit(repo.store.get(oid)!.data).parents;
+      const parents = commitInfoOf(oid, repo.store.get(oid)!.data).parents;
       const atLimit = deepen !== null && generation >= deepen;
       if (atLimit) {
         for (const parent of parents) {
@@ -220,13 +242,14 @@ function planFetch(
   }
   // A commit whose parents were all included or held is not a boundary.
   for (const oid of [...newShallow]) {
-    const parents = parseCommit(repo.store.get(oid)!.data).parents;
+    const parents = commitInfoOf(oid, repo.store.get(oid)!.data).parents;
     if (parents.every((p) => includeCommits.has(p) || held.has(p))) newShallow.delete(oid);
   }
   const unshallow: string[] = [];
   for (const oid of shallowBoundary) {
     if (includeCommits.has(oid)) {
-      const parents = parseCommit(repo.store.get(oid)?.data ?? Buffer.alloc(0)).parents;
+      const obj = repo.store.get(oid);
+      const parents = obj ? commitInfoOf(oid, obj.data).parents : [];
       if (parents.some((p) => includeCommits.has(p))) unshallow.push(oid);
     }
   }
@@ -249,13 +272,31 @@ function planFetch(
   return { send: [...commits, ...others], shallow: [...newShallow], unshallow, common };
 }
 
-function packfileSection(repo: RepoState, oids: readonly string[]): Buffer {
+/**
+ * Whole-pack cache keyed by the object id list: ids are content
+ * hashes, so the same list always yields the same pack bytes, and
+ * repeated fetches of one tip (the clone benchmark's fifty shallow
+ * clones, a client's retries) skip the rebuild entirely.
+ */
+const packCache = new Map<string, Buffer>();
+
+function packFor(repo: RepoState, oids: readonly string[]): Buffer {
+  const key = oids.join(' ');
+  let pack = packCache.get(key);
+  if (pack) return pack;
   const objects: GitObject[] = [];
   for (const oid of oids) {
     const obj = repo.store.get(oid);
     if (obj) objects.push(obj);
   }
-  const pack = writePack(objects);
+  pack = writePack(objects);
+  if (packCache.size > 256) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
+}
+
+function packfileSection(repo: RepoState, oids: readonly string[]): Buffer {
+  const pack = packFor(repo, oids);
   const parts: Buffer[] = [pktText('packfile\n')];
   const CHUNK = 32 * 1024;
   for (let at = 0; at < pack.length; at += CHUNK) {
@@ -334,12 +375,7 @@ export function uploadPack(repo: RepoState, body: Buffer, version2: boolean): Bu
   if (plan.common.length) parts.push(pktText(`ACK ${plan.common[plan.common.length - 1]}\n`));
   else parts.push(pktText('NAK\n'));
   if (plan.send.length) {
-    const objects: GitObject[] = [];
-    for (const oid of plan.send) {
-      const obj = repo.store.get(oid);
-      if (obj) objects.push(obj);
-    }
-    const pack = writePack(objects);
+    const pack = packFor(repo, plan.send);
     const CHUNK = 32 * 1024;
     for (let at = 0; at < pack.length; at += CHUNK) {
       parts.push(pktLine(Buffer.concat([Buffer.from([1]), pack.subarray(at, at + CHUNK)])));

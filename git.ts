@@ -141,6 +141,37 @@ export function identLine(name: string, email: string, unixSeconds: number): str
   return `${name} <${email}> ${unixSeconds} +0000`;
 }
 
+// ------------------------------------------------------------------ parse caches
+
+/**
+ * Parsed commits and trees, memoized by object id. Object ids are
+ * content hashes, so a cached parse is valid forever and across
+ * repositories; fetch planning and ancestry walks re-parse the same
+ * objects on every request without these.
+ */
+const commitInfoCache = new Map<string, CommitInfo>();
+const treeEntriesCache = new Map<string, TreeEntry[]>();
+
+export function commitInfoOf(oid: string, data: Buffer): CommitInfo {
+  let info = commitInfoCache.get(oid);
+  if (!info) {
+    if (commitInfoCache.size > 200000) commitInfoCache.clear();
+    info = parseCommit(data);
+    commitInfoCache.set(oid, info);
+  }
+  return info;
+}
+
+export function treeEntriesOf(oid: string, data: Buffer): TreeEntry[] {
+  let entries = treeEntriesCache.get(oid);
+  if (!entries) {
+    if (treeEntriesCache.size > 200000) treeEntriesCache.clear();
+    entries = parseTree(data);
+    treeEntriesCache.set(oid, entries);
+  }
+  return entries;
+}
+
 // ------------------------------------------------------------------ deltas
 
 function readDeltaVarint(buf: Buffer, at: number): { value: number; next: number } {
@@ -191,50 +222,51 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 // ------------------------------------------------------------------ packs
 
-/**
- * Inflate one zlib stream starting at `at`, finding where it ends by
- * growing a probe window until the stream decodes. Packs here are small
- * (the suite pushes plain objects), so the doubling search costs little.
- */
-function inflateOne(buf: Buffer, at: number): { data: Buffer; next: number } {
-  let span = Math.min(buf.length - at, 64);
-  for (;;) {
-    try {
-      const data = inflateSync(buf.subarray(at, at + span));
-      // A successful decode of a truncated slice can happen only when the
-      // slice ends exactly at the stream end; verify by shrinking is overkill:
-      // git streams are self-terminating, so the first span that decodes AND
-      // reaches a stream end is found by checking a single extra byte class:
-      // we accept the smallest span that decodes fully.
-      return { data, next: at + consumedZlibLength(buf, at, span, data) };
-    } catch {
-      if (at + span >= buf.length) throw new Error('pack object is truncated');
-      span = Math.min(buf.length - at, span * 2);
+/** Adler-32 of a buffer, the checksum every zlib stream ends with. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  let at = 0;
+  while (at < data.length) {
+    const end = Math.min(at + 5552, data.length);
+    for (; at < end; at++) {
+      a += data[at];
+      b += a;
     }
+    a %= 65521;
+    b %= 65521;
   }
+  return ((b << 16) | a) >>> 0;
 }
 
 /**
- * The exact compressed length of the zlib stream at `at`, given a span
- * known to decode: bisect for the smallest prefix that still decodes to
- * the same bytes.
+ * Inflate one zlib stream starting at `at` and find exactly where it
+ * ends. Node's inflateSync decodes a stream and ignores whatever
+ * follows it in the buffer, so one call yields the data; the stream's
+ * end is then located by searching for the data's Adler-32 (the last
+ * four bytes of every zlib stream) and confirming the candidate end
+ * decodes to the same bytes.
  */
-function consumedZlibLength(buf: Buffer, at: number, span: number, expected: Buffer): number {
-  let lo = 1;
-  let hi = span;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    let ok = false;
-    try {
-      const data = inflateSync(buf.subarray(at, at + mid));
-      ok = data.equals(expected);
-    } catch {
-      ok = false;
-    }
-    if (ok) hi = mid;
-    else lo = mid + 1;
+function inflateOne(buf: Buffer, at: number): { data: Buffer; next: number } {
+  let data: Buffer;
+  try {
+    data = inflateSync(buf.subarray(at));
+  } catch {
+    throw new Error('pack object is truncated');
   }
-  return lo;
+  const tail = Buffer.alloc(4);
+  tail.writeUInt32BE(adler32(data), 0);
+  let idx = buf.indexOf(tail, at);
+  while (idx !== -1) {
+    const end = idx + 4;
+    try {
+      if (inflateSync(buf.subarray(at, end)).equals(data)) return { data, next: end };
+    } catch {
+      // a coincidental checksum sequence inside the stream: keep looking
+    }
+    idx = buf.indexOf(tail, idx + 1);
+  }
+  throw new Error('pack object is truncated');
 }
 
 export interface PackReadResult {
@@ -335,6 +367,38 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
   return { objects: result, count };
 }
 
+/**
+ * Pack entries (object header + deflated body) are cached per object:
+ * store objects are immutable and fetches repeat the same objects, so
+ * re-deflating them on every pack is waste. Deflation runs at the
+ * fastest level; the wire only requires a valid zlib stream.
+ */
+const packEntryCache = new WeakMap<GitObject, Buffer>();
+
+function packEntry(obj: GitObject): Buffer {
+  const cached = packEntryCache.get(obj);
+  if (cached) return cached;
+  const code = TYPE_CODES[obj.type];
+  let size = obj.data.length;
+  const first = (code << 4) | (size & 0x0f);
+  size >>= 4;
+  const headBytes: number[] = [];
+  if (size > 0) {
+    headBytes.push(first | 0x80);
+    while (size > 0) {
+      let b = size & 0x7f;
+      size >>= 7;
+      if (size > 0) b |= 0x80;
+      headBytes.push(b);
+    }
+  } else {
+    headBytes.push(first);
+  }
+  const entry = Buffer.concat([Buffer.from(headBytes), deflateSync(obj.data, { level: 1 })]);
+  packEntryCache.set(obj, entry);
+  return entry;
+}
+
 /** Write a packfile of plain objects (no deltas), as the suite's client does. */
 export function writePack(objects: readonly GitObject[]): Buffer {
   const parts: Buffer[] = [];
@@ -343,26 +407,7 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
-  for (const obj of objects) {
-    const code = TYPE_CODES[obj.type];
-    let size = obj.data.length;
-    const first = (code << 4) | (size & 0x0f);
-    size >>= 4;
-    const headBytes: number[] = [];
-    if (size > 0) {
-      headBytes.push(first | 0x80);
-      while (size > 0) {
-        let b = size & 0x7f;
-        size >>= 7;
-        if (size > 0) b |= 0x80;
-        headBytes.push(b);
-      }
-    } else {
-      headBytes.push(first);
-    }
-    parts.push(Buffer.from(headBytes));
-    parts.push(deflateSync(obj.data));
-  }
+  for (const obj of objects) parts.push(packEntry(obj));
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
   return Buffer.concat([body, trailer]);
