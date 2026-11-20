@@ -26,7 +26,7 @@ export function sha1Hex(data: Buffer): string {
 /** The id an object body hashes to: sha1 of "<type> <length>\0" + body. */
 export function objectId(type: GitObjectType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 // ------------------------------------------------------------------ store
@@ -241,18 +241,25 @@ function adler32(data: Buffer): number {
 
 /**
  * Inflate one zlib stream starting at `at` and find exactly where it
- * ends. Node's inflateSync decodes a stream and ignores whatever
- * follows it in the buffer, so one call yields the data; the stream's
- * end is then located by searching for the data's Adler-32 (the last
- * four bytes of every zlib stream) and confirming the candidate end
- * decodes to the same bytes.
+ * ends. Asked for its info, Node's inflateSync reports how many input
+ * bytes the stream consumed (the engine's bytesWritten), so one call
+ * yields both the data and the stream's end. Where that count is not
+ * available, the end is located the slow way: search for the data's
+ * Adler-32 (the last four bytes of every zlib stream) and confirm the
+ * candidate end decodes to the same bytes.
  */
 function inflateOne(buf: Buffer, at: number): { data: Buffer; next: number } {
   let data: Buffer;
+  let consumed = 0;
   try {
-    data = inflateSync(buf.subarray(at));
+    const res = inflateSync(buf.subarray(at), { info: true });
+    data = res.buffer;
+    consumed = res.engine.bytesWritten;
   } catch {
     throw new Error('pack object is truncated');
+  }
+  if (Number.isSafeInteger(consumed) && consumed > 0 && at + consumed <= buf.length) {
+    return { data, next: at + consumed };
   }
   const tail = Buffer.alloc(4);
   tail.writeUInt32BE(adler32(data), 0);

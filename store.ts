@@ -109,9 +109,12 @@ export class Forge {
   private clockTick = 0;
 
   private readonly trialNow: string | null;
+  /** The trial "now" (or the fixed epoch) in milliseconds, parsed once. */
+  private readonly baseMs: number;
 
   constructor(trialNow: string | null) {
     this.trialNow = trialNow;
+    this.baseMs = trialNow ? Date.parse(trialNow) : Date.parse('2025-01-01T00:00:00Z');
   }
 
   get viewer(): UserInfo {
@@ -133,16 +136,14 @@ export class Forge {
 
   /** The next logical timestamp: trial "now" when given, else a fixed epoch, +1s per event. */
   now(): string {
-    const base = this.trialNow ? Date.parse(this.trialNow) : Date.parse('2025-01-01T00:00:00Z');
-    const at = new Date(base + this.clockTick * 1000);
+    const at = new Date(this.baseMs + this.clockTick * 1000);
     this.clockTick += 1;
     return at.toISOString().replace(/\.\d{3}Z$/, 'Z');
   }
 
   /** Unix seconds matching now(), for git ident lines. */
   nowUnix(): number {
-    const base = this.trialNow ? Date.parse(this.trialNow) : Date.parse('2025-01-01T00:00:00Z');
-    return Math.floor(base / 1000) + this.clockTick;
+    return Math.floor(this.baseMs / 1000) + this.clockTick;
   }
 
   createRepo(name: string, description: string, isPrivate: boolean, defaultBranch: string): RepoState {
