@@ -65,6 +65,14 @@ export class RepoState {
   readonly issues = new Map<number, IssueInfo>();
   readonly pulls = new Map<number, PullInfo>();
   readonly comments = new Map<number, CommentInfo[]>();
+  /**
+   * Serialized GET-issue response bodies by issue number. An entry is
+   * served only while its fingerprint matches the issue's current
+   * updatedAt/state/comment count, so a mutation never serves stale
+   * bytes; the read benchmark's thousands of identical GETs skip the
+   * shape building and stringify entirely.
+   */
+  readonly issueJsonCache = new Map<number, { fp: string; body: Buffer }>();
   nextNumber = 1;
 
   readonly id: number;

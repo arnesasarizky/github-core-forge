@@ -18,6 +18,20 @@ import type { RepoState } from './store.ts';
 
 const AGENT = 'forge/1.0';
 
+/**
+ * The protocol-v2 advertisement never changes (no refs in it), so it
+ * is framed once at startup instead of on every upload-pack probe.
+ */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktText('version 2\n'),
+  pktText(`agent=${AGENT}\n`),
+  pktText('ls-refs=unborn\n'),
+  pktText('fetch=shallow wait-for-done\n'),
+  pktText('server-option\n'),
+  pktText('object-format=sha1\n'),
+  pktLine('flush'),
+]);
+
 // ------------------------------------------------------------------ helpers
 
 /** Every object reachable from a root (commit, tree, blob or tag). */
@@ -61,30 +75,78 @@ function commitAncestors(repo: RepoState, from: string, boundary?: ReadonlySet<s
 }
 
 /**
- * Full ancestor sets, memoized by commit id (content hashes: a
- * commit's ancestors never change). A fast-forward check on a long
- * chain would otherwise re-walk the whole history on every push.
+ * Commit generations — the longest chain from the commit down to a
+ * root — memoized by commit id (content hashes: a commit's
+ * generation never changes). The fast-forward check used to
+ * materialize the descendant's whole ancestor set, an O(history)
+ * set copy per push; with generations memoized the check walks
+ * from the descendant and prunes every branch at or below the
+ * target's generation, which is all a fast-forward verdict needs.
  */
-const ancestorsCache = new Map<string, Set<string>>();
+const generationCache = new Map<string, number>();
 
-function ancestorsOf(repo: RepoState, oid: string): Set<string> {
-  let cached = ancestorsCache.get(oid);
-  if (cached) return cached;
-  if (ancestorsCache.size > 100000) ancestorsCache.clear();
-  cached = new Set<string>([oid]);
-  ancestorsCache.set(oid, cached);
-  const obj = repo.store.get(oid);
-  if (obj?.type === 'commit') {
-    for (const parent of commitInfoOf(oid, obj.data).parents) {
-      for (const ancestor of ancestorsOf(repo, parent)) cached.add(ancestor);
+function generationOf(repo: RepoState, oid: string): number | undefined {
+  const known = generationCache.get(oid);
+  if (known !== undefined) return known;
+  // Iterative post-order fill: generations for oid and its ancestry.
+  const stack: Array<{ oid: string; expanded: boolean }> = [{ oid, expanded: false }];
+  while (stack.length) {
+    const top = stack[stack.length - 1];
+    if (generationCache.has(top.oid)) {
+      stack.pop();
+      continue;
     }
+    const obj = repo.store.get(top.oid);
+    if (!obj || obj.type !== 'commit') {
+      stack.pop();
+      continue;
+    }
+    const parents = commitInfoOf(top.oid, obj.data).parents;
+    if (!top.expanded) {
+      top.expanded = true;
+      for (const parent of parents) {
+        if (!generationCache.has(parent)) stack.push({ oid: parent, expanded: false });
+      }
+      continue;
+    }
+    let gen = 0;
+    for (const parent of parents) {
+      const parentGen = generationCache.get(parent);
+      if (parentGen !== undefined && parentGen + 1 > gen) gen = parentGen + 1;
+    }
+    if (generationCache.size > 200000) generationCache.clear();
+    generationCache.set(top.oid, gen);
+    stack.pop();
   }
-  return cached;
+  return generationCache.get(oid);
 }
 
 export function isAncestor(repo: RepoState, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return ancestorsOf(repo, descendant).has(ancestor);
+  const targetGen = generationOf(repo, ancestor);
+  // Fill generations along the descendant's ancestry so the walk can
+  // prune; a target that names no commit here can still match a
+  // parent reference by equality, which the walk checks first.
+  generationOf(repo, descendant);
+  const seen = new Set<string>([descendant]);
+  const stack = [descendant];
+  while (stack.length) {
+    const oid = stack.pop()!;
+    const obj = repo.store.get(oid);
+    if (!obj || obj.type !== 'commit') continue;
+    for (const parent of commitInfoOf(oid, obj.data).parents) {
+      if (parent === ancestor) return true;
+      if (seen.has(parent)) continue;
+      seen.add(parent);
+      // A commit at or below the target's generation can neither be
+      // the target (equality was just checked) nor lead to it:
+      // generations strictly decrease along parent edges.
+      const parentGen = generationCache.get(parent);
+      if (parentGen !== undefined && targetGen !== undefined && parentGen <= targetGen) continue;
+      stack.push(parent);
+    }
+  }
+  return false;
 }
 
 /** Peel a tag (or return the commit itself) to the commit it names. */
@@ -115,16 +177,7 @@ export function infoRefs(repo: RepoState | null, service: string, version2: bool
   }
   const type = `application/x-${service}-advertisement`;
   if (service === 'git-upload-pack' && version2) {
-    const lines = [
-      pktText('version 2\n'),
-      pktText(`agent=${AGENT}\n`),
-      pktText('ls-refs=unborn\n'),
-      pktText('fetch=shallow wait-for-done\n'),
-      pktText('server-option\n'),
-      pktText('object-format=sha1\n'),
-      pktLine('flush'),
-    ];
-    return { status: 200, type, body: Buffer.concat(lines) };
+    return { status: 200, type, body: V2_ADVERTISEMENT };
   }
   const caps =
     service === 'git-upload-pack'

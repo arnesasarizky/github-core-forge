@@ -66,6 +66,17 @@ export function createApp(options: AppOptions = {}): Server {
     res.end(text);
   }
 
+  /** Send a pre-serialized JSON body: no stringify, no re-encode on write. */
+  function sendBuffer(res: ServerResponse, status: number, body: Buffer): void {
+    requestCounter += 1;
+    res.writeHead(status, {
+      'content-type': JSON_TYPE,
+      'x-github-request-id': `F0RGE-${requestCounter.toString(16).padStart(8, '0')}`,
+      'content-length': body.length,
+    });
+    res.end(body);
+  }
+
   function sendResult(res: ServerResponse, result: RestResult): void {
     if (result.status === 204) {
       requestCounter += 1;
@@ -81,10 +92,20 @@ export function createApp(options: AppOptions = {}): Server {
     return req.headers.authorization === `Bearer ${token}`;
   }
 
-  async function readBody(req: IncomingMessage): Promise<Buffer> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    return Buffer.concat(chunks);
+  /**
+   * Read a whole request body. The event form replaces an async
+   * iterator: same bytes, same failure surface (a dead request rejects
+   * instead of throwing out of the iterator), measurably less stream
+   * machinery per request.
+   */
+  function readBody(req: IncomingMessage): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk) => chunks.push(chunk as Buffer));
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+      req.on('close', () => reject(new Error('request closed before its body ended')));
+    });
   }
 
   /** Parse a JSON body; on failure answer 400 and return undefined. */
@@ -353,7 +374,17 @@ export function createApp(options: AppOptions = {}): Server {
         const number = parseInt(rest[1], 10);
         if (rest.length === 2 && method === 'GET') {
           const issue = repo.issues.get(number);
-          if (issue) return sendJson(res, 200, issueShape(forge, repo, issue));
+          if (issue) {
+            // Serve the serialized body while nothing the shape reads
+            // has moved: every issue mutation bumps updatedAt, comments
+            // only change the count, labels are immutable once created.
+            const fp = `${forge.viewerLogin}|${issue.updatedAt}|${issue.state}|${(repo.comments.get(number) ?? []).length}`;
+            const hit = repo.issueJsonCache.get(number);
+            if (hit && hit.fp === fp) return sendBuffer(res, 200, hit.body);
+            const body = Buffer.from(`${JSON.stringify(issueShape(forge, repo, issue))}\n`, 'utf8');
+            repo.issueJsonCache.set(number, { fp, body });
+            return sendBuffer(res, 200, body);
+          }
           const pull = repo.pulls.get(number);
           if (pull) {
             const shape = issueShape(forge, repo, {
